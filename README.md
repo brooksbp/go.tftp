@@ -1,4 +1,5 @@
 go.tftp
 =======
 
-TFTP in Go
+This is a work-in-progress TFTP implementation in Go.
+
