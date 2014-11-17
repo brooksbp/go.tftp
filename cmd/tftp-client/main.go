@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/brooksbp/go.tftp/tftp"
+	"github.com/brooksbp/go.tftp"
 )
 
 var (
