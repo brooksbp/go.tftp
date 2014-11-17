@@ -9,72 +9,16 @@ import (
 	"sync"
 )
 
+// Server is an TFTP server.
 type Server struct {
-	listenAddr *net.UDPAddr
-	conn       *net.UDPConn
+	conn *net.UDPConn
 
+	// TODO: decouple storage from server.
 	mu sync.RWMutex
 	m  map[string][]byte
 }
 
-func NewServer(listenAddr string) (*Server, error) {
-	addr, err := net.ResolveUDPAddr("udp", listenAddr)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return &Server{
-		listenAddr: addr,
-		conn:       conn,
-	}, nil
-}
-
-func (s *Server) Run() error {
-	var buf [MaxMsgSize]byte
-
-	for {
-		n, caddr, err := s.conn.ReadFromUDP(buf[0:])
-		if err != nil {
-			return err
-		}
-
-		framer := NewFramer(bytes.NewBuffer(buf[0:n]))
-
-		frame, err := framer.ReadFrame()
-		if err != nil {
-			log.Print("ReadFrame:", err)
-			continue
-		}
-
-		switch frame := frame.(type) {
-		case *RRQFrame:
-			go s.handleReadRequest(caddr, frame)
-		case *WRQFrame:
-			go s.handleWriteRequest(caddr, frame)
-		default:
-			log.Print("Unhandled conn:", frame)
-		}
-	}
-}
-
-func newConnection() (*net.UDPConn, error) {
-	saddr, err := net.ResolveUDPAddr("udp", ":0")
-	if err != nil {
-		log.Print("ResolveUDPAddr:", err)
-		return nil, err
-	}
-	conn, err := net.ListenUDP("udp", saddr)
-	if err != nil {
-		log.Print("ListenUDP:", err)
-		return nil, err
-	}
-	return conn, nil
-}
-
-// If |fname| exists, return a reader interface and True, otherwise nil.
+// fetchFile returns a reader interface to file referenced by |fname|.
 func (s *Server) fetchFile(fname *string) (*bytes.Reader, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -88,10 +32,10 @@ func (s *Server) fetchFile(fname *string) (*bytes.Reader, bool) {
 	if !ok {
 		return nil, false
 	}
-
 	return bytes.NewReader(s.m[*fname]), true
 }
 
+// putFile stores file |fname|.
 func (s *Server) putFile(fname *string, f *bytes.Buffer) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,7 +43,7 @@ func (s *Server) putFile(fname *string, f *bytes.Buffer) bool {
 	if s.m == nil {
 		s.m = make(map[string][]byte)
 	} else {
-		// Verify again that the file does not exist.
+		// Verify that the file does not already exist.
 		_, ok := s.m[*fname]
 		if ok {
 			return false
@@ -110,8 +54,39 @@ func (s *Server) putFile(fname *string, f *bytes.Buffer) bool {
 	return true
 }
 
-func UDPAddrEqual(a, b *net.UDPAddr) bool {
-	return a.IP.Equal(b.IP) && a.Port == b.Port && a.Zone == b.Zone
+func NewServer(listenAddr string) (*Server, error) {
+	conn, err := resolveAndListen(listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{conn: conn}, nil
+}
+
+func (s *Server) Run() error {
+	var buf [MaxMsgSize]byte
+
+	for {
+		n, caddr, err := s.conn.ReadFromUDP(buf[0:])
+		if err != nil {
+			return err
+		}
+
+		framer := NewFramer(bytes.NewBuffer(buf[:n]))
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			log.Print("ReadFrame:", err)
+			continue
+		}
+		switch frame := frame.(type) {
+		case *RRQFrame:
+			go s.handleReadRequest(caddr, frame)
+		case *WRQFrame:
+			go s.handleWriteRequest(caddr, frame)
+		default:
+			log.Print("Unhandled conn:", frame)
+		}
+	}
+	// TODO: s.conn.Close()
 }
 
 // Recieve a DATA msg from |peerAddr| and write contents into |writer|. Reply
@@ -122,13 +97,11 @@ func recvData(conn *net.UDPConn, peerAddr *net.UDPAddr, writer *bytes.Buffer) (i
 	if err != nil {
 		return 0, err
 	}
-	if !UDPAddrEqual(addr, peerAddr) {
-		return 0, fmt.Errorf("Expecting addr=%s, got=%s",
-			peerAddr, addr)
+	if !addrEqual(addr, peerAddr) {
+		return 0, fmt.Errorf("Expecting addr=%s, got=%s", peerAddr, addr)
 	}
 
-	buffer := bytes.NewBuffer(buf[:n])
-	framer := NewFramer(buffer)
+	framer := NewFramer(bytes.NewBuffer(buf[:n]))
 	frame, err := framer.ReadFrame()
 	if err != nil {
 		return 0, err
@@ -152,12 +125,13 @@ func recvData(conn *net.UDPConn, peerAddr *net.UDPAddr, writer *bytes.Buffer) (i
 	return n, nil
 }
 
+// Send DATA message |dataFrame| to client |peerAddr|.
 func sendData(conn *net.UDPConn, peerAddr *net.UDPAddr, dataFrame *DATAFrame) error {
 	blockNum := (*dataFrame).BlockNum
-	buffer := new(bytes.Buffer)
-	framer := NewFramer(buffer)
 
-	// TODO: timeouts, resend, invalid blocknums..
+	framer := NewFramer(new(bytes.Buffer))
+
+	// TODO: handle timeouts, retransmission, blknum ordering issues..
 
 	if err := framer.WriteFrame(dataFrame); err != nil {
 		return err
@@ -165,13 +139,14 @@ func sendData(conn *net.UDPConn, peerAddr *net.UDPAddr, dataFrame *DATAFrame) er
 	if _, err := conn.WriteToUDP(framer.Bytes(), peerAddr); err != nil {
 		return err
 	}
+	framer.Reset()
 
 	buf := make([]byte, MaxMsgSize)
 	_, addr, err := conn.ReadFromUDP(buf)
 	if err != nil {
 		return err
 	}
-	if addr != peerAddr {
+	if !addrEqual(addr, peerAddr) {
 		return fmt.Errorf("Expecting addr=%s", peerAddr)
 	}
 	if _, err := framer.Write(buf); err != nil {
@@ -191,18 +166,19 @@ func sendData(conn *net.UDPConn, peerAddr *net.UDPAddr, dataFrame *DATAFrame) er
 	return nil
 }
 
+// handleReadRequest handles a new incoming RRQ to the server. Setup an
+// ephemeral port to use for the new connection and serve the file.
 func (s *Server) handleReadRequest(peerAddr *net.UDPAddr, rrqFrame *RRQFrame) {
-	// Setup a new connection used to service read request.
-	conn, err := newConnection()
+	var fname string = rrqFrame.Filename
+	var mode string = rrqFrame.Mode
+
+	conn, err := resolveAndListen(":0")
 	if err != nil {
 		return
 	}
 
-	mode := rrqFrame.Mode
-	fname := rrqFrame.Filename
-
 	if mode != ModeOctet {
-		log.Print("mode:", mode)
+		log.Print("Unhandled mode:", mode)
 		return
 	}
 
@@ -220,6 +196,7 @@ func (s *Server) handleReadRequest(peerAddr *net.UDPAddr, rrqFrame *RRQFrame) {
 		return
 	}
 
+	// Read file MaxDataSize bytes at a time and send to client.
 	buf := make([]byte, MaxDataSize)
 
 	for block := 1; ; block++ {
@@ -239,26 +216,30 @@ func (s *Server) handleReadRequest(peerAddr *net.UDPAddr, rrqFrame *RRQFrame) {
 			break
 		}
 	}
+
+	if err := conn.Close(); err != nil {
+		log.Print(err)
+	}
 }
 
+// handleWriteRequest handles a new incoming WRQ to the server. Setup an
+// emphemeral port to use for the new connection and recieve incoming data.
 func (s *Server) handleWriteRequest(peerAddr *net.UDPAddr, wrqFrame *WRQFrame) {
-	conn, err := newConnection()
+	var fname string = wrqFrame.Filename
+	var mode string = wrqFrame.Mode
+
+	conn, err := resolveAndListen(":0")
 	if err != nil {
 		return
 	}
 
-	mode := wrqFrame.Mode
-	fname := wrqFrame.Filename
-
 	if mode != ModeOctet {
-		log.Print("mode:", mode)
+		log.Print("Unhandled mode:", mode)
 		return
 	}
 
-	_, exists := s.fetchFile(&fname)
-
 	// If file exists, send an error message.
-	if exists {
+	if _, exists := s.fetchFile(&fname); exists {
 		msg := &ERRORFrame{
 			ErrorCode: uint16(ErrorFileAlreadyExists),
 			ErrMsg:    "",
@@ -269,18 +250,21 @@ func (s *Server) handleWriteRequest(peerAddr *net.UDPAddr, wrqFrame *WRQFrame) {
 		return
 	}
 
-	// Otherwise, send ACK block number 0.
-	msg := &ACKFrame{BlockNum: uint16(0)}
+	// Acknowledge the write request with an ACK BlockNum=0 message.
+	msg := &ACKFrame{
+		BlockNum: uint16(0),
+	}
 	if err := sendFrame(conn, peerAddr, msg); err != nil {
 		return
 	}
 
+	// Receive DATA messages containing |fname| data.
 	writer := new(bytes.Buffer)
 
 	for {
 		n, err := recvData(conn, peerAddr, writer)
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
 			return
 		}
 		if n < MaxDataSize {
@@ -288,8 +272,13 @@ func (s *Server) handleWriteRequest(peerAddr *net.UDPAddr, wrqFrame *WRQFrame) {
 		}
 	}
 
-	// Store new file.
+	// Store |fname|.
 	if !s.putFile(&fname, writer) {
 		return
 	}
+
+	if err := conn.Close(); err != nil {
+		log.Print(err)
+	}
+
 }
